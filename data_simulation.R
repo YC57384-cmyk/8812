@@ -1,7 +1,7 @@
 if(!require(lavaan)) install.packages("lavaan")
 library(lavaan)
 
-# Define the population model (Strict format to bypass lavaan parser bugs)
+# Define the population model 
 population_model <- '
   Assertiveness =~ 0.8*SAQ1 + 0.7*SAQ2 + 0.8*SAQ3
   Distress =~ 0.8*SDS1 + 0.8*SDS2 + 0.7*SDS3
@@ -16,5 +16,5 @@ set.seed(2024)
 simulated_data <- simulateData(population_model, sample.nobs = 500)
 print(head(simulated_data))
 
-write.csv(simulated_data, "simulated_sexual_health_data.csv", row.names = FALSE)
+write.csv(simulated_data, "~/Desktop/simulateddata.csv", row.names = FALSE)
 cat("Data successfully generated and saved to:\n", file.path(getwd(), "simulateddata.csv"), "\n")
