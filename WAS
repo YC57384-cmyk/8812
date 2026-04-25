@@ -1,1 +1,64 @@
 
+# PSYC8812 Term Paper Analysis Script
+# Project: Ecology Shapes Women’s Executable Autonomy and Mate Preferences
+# Reporter: Ziying Zheng
+# ==============================================================================
+
+library(readxl)
+library(dplyr)
+library(stringr)
+library(effsize) 
+library(psych)   
+library(mediation) 
+
+dat_raw <- read_excel("zzy.xlsx", sheet = "原始数据")
+
+dat_main <- dat_raw %>%
+  mutate(
+    birthplace_self = str_squish(`您的出生地是?(城市/乡镇名字)`),
+    birthplace_mother = str_squish(`您母亲的出生地是?(城市/乡镇名字)`),
+    birthplace_father = str_squish(`您父亲的出生地是?(城市/乡镇名字)`),
+    place_all = paste0(birthplace_self, birthplace_mother, birthplace_father)
+  ) %>%
+  mutate(
+    region_final = case_when(
+      str_detect(place_all, "云南|昆明|丽江|昭通|曲靖|玉溪|大理|保山|普洱|临沧|楚雄|红河|开远|石屏|文山|西双版纳") ~ "Yunnan",
+      str_detect(place_all, "内蒙古|内蒙|呼和浩特|包头|鄂尔多斯|赤峰|通辽|呼伦贝尔|乌兰察布|巴彦淖尔") ~ "Inner Mongolia",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(region_final))
+
+dat_main <- dat_main %>%
+  mutate(
+    genes_vs_security = mp_good_genes - (mp_good_parents + mp_good_providers) / 2
+  )
+
+dat_main <- dat_main %>%
+  mutate(
+    wa_z = as.numeric(scale(wa_total)),
+    wsa_z = as.numeric(scale(wsa_total)),
+    exec_auto = rowMeans(across(c(wa_z, wsa_z)), na.rm = TRUE)
+  )
+
+
+t.test(wa_total ~ region_final, data = dat_main) 
+cohen.d(wa_total ~ region_final, data = dat_main) # d = 0.45
+t.test(wsa_total ~ region_final, data = dat_main)
+cohen.d(wsa_total ~ region_final, data = dat_main) # d = 0.86
+
+m_h3 <- lm(genes_vs_security ~ exec_auto, data = dat_main)
+summary(m_h3) # beta = 0.358, R2 = 0.12
+
+dat_med <- dat_main %>%
+  mutate(region_bin = ifelse(region_final == "Yunnan", 1, 0)) %>%
+  dplyr::select(region_bin, exec_auto, genes_vs_security) %>%
+  na.omit()
+
+med_model <- lm(exec_auto ~ region_bin, data = dat_med)
+out_model <- lm(genes_vs_security ~ region_bin + exec_auto, data = dat_med)
+
+set.seed(1234)
+results_med <- mediate(med_model, out_model, treat = "region_bin", 
+                       mediator = "exec_auto", boot = TRUE, sims = 5000)
+summary(results_med) 
