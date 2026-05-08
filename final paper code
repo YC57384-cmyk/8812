@@ -1,0 +1,546 @@
+library(readxl)
+library(dplyr)
+library(stringr)
+library(janitor)
+library(psych)
+library(effsize)
+library(mediation)
+
+dat_raw <- read_excel("~/Desktop/zzy.xlsx", sheet = "原始数据")
+
+get_col_or_na <- function(data, col_name) {
+  if (col_name %in% names(data)) {
+    return(as.character(data[[col_name]]))
+  } else {
+    return(rep(NA_character_, nrow(data)))
+  }
+}
+
+if (!"age" %in% names(dat_raw)) {
+  stop("No column named 'age' was found. Please check the Excel column name.")
+}
+
+dat_main <- dat_raw %>%
+  mutate(
+    birthplace_self = str_squish(get_col_or_na(., "您的出生地是？（城市/乡镇名字）")),
+    birthplace_mother = str_squish(get_col_or_na(., "您母亲的出生地是？（城市/乡镇名字）")),
+    birthplace_father = str_squish(get_col_or_na(., "您父亲的出生地是？（城市/乡镇名字）")),
+    age_raw = as.character(.data[["age"]]),
+    age_clean = suppressWarnings(as.numeric(str_extract(age_raw, "\\d+"))),
+    education_raw = get_col_or_na(., "您的最高教育水平是："),
+    place_all = paste(
+      birthplace_self,
+      birthplace_mother,
+      birthplace_father,
+      sep = " "
+    ),
+    hit_yunnan = str_detect(
+      place_all,
+      "云南|昆明|丽江|华坪|昭通|曲靖|玉溪|大理|保山|普洱|临沧|楚雄|红河|开远|石屏|文山|西双版纳|德宏"
+    ),
+    hit_inner_mongolia = str_detect(
+      place_all,
+      "内蒙古|内蒙|呼和浩特|呼市|包头|鄂尔多斯|鄂市|赤峰|通辽|呼伦贝尔|乌兰察布|察右前旗|巴彦淖尔"
+    ),
+    region_final = case_when(
+      hit_yunnan & !hit_inner_mongolia ~ "Yunnan",
+      !hit_yunnan & hit_inner_mongolia ~ "Inner Mongolia",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(region_final %in% c("Yunnan", "Inner Mongolia")) %>%
+  mutate(
+    region_final = factor(region_final, levels = c("Inner Mongolia", "Yunnan")),
+    education = factor(
+      education_raw,
+      levels = c("小学及以下", "初中", "高中", "本科", "硕士及以上"),
+      ordered = TRUE
+    ),
+    education_3 = case_when(
+      education_raw %in% c("小学及以下", "初中") ~ "Low",
+      education_raw %in% c("高中") ~ "Middle",
+      education_raw %in% c("本科", "硕士及以上") ~ "High",
+      TRUE ~ NA_character_
+    ),
+    education_3 = factor(education_3, levels = c("Low", "Middle", "High"))
+  )
+
+nrow(dat_main)
+table(dat_main$region_final, useNA = "ifany")
+table(dat_main$education_raw, useNA = "ifany")
+table(dat_main$education_3, useNA = "ifany")
+summary(dat_main$age_clean)
+sum(is.na(dat_main$age_clean))
+
+decode_onehot_score <- function(data, cols, score_map) {
+  mat <- data[, cols, drop = FALSE]
+  picked <- !is.na(mat)
+  no_pick <- rowSums(picked) == 0
+  multi_pick <- rowSums(picked) > 1
+  
+  pos <- apply(picked, 1, function(x) {
+    idx <- which(x)
+    if (length(idx) == 1) idx else NA_integer_
+  })
+  
+  score <- score_map[pos]
+  score[no_pick | multi_pick] <- NA_real_
+  return(score)
+}
+
+mp_prefix <- "您作为女性，请根据以下特质在长期伴侣关系中的重要程度进行评分。（每个特质仅限选择一个分数）"
+
+mp_cols_all <- names(dat_main)[
+  str_detect(names(dat_main), fixed(mp_prefix))
+]
+
+length(mp_cols_all)
+
+for (i in 1:24) {
+  item_cols <- mp_cols_all[
+    str_detect(mp_cols_all, regex(paste0("\\s*", i, "\\.")))
+  ]
+  
+  item_cols <- c(
+    item_cols[str_detect(item_cols, " - 最不重要$")],
+    item_cols[str_detect(item_cols, " - 2$")],
+    item_cols[str_detect(item_cols, " - 3$")],
+    item_cols[str_detect(item_cols, " - 4$")],
+    item_cols[str_detect(item_cols, " - 5$")],
+    item_cols[str_detect(item_cols, " - 最重要$")]
+  )
+  
+  if (length(item_cols) != 6) {
+    stop(paste0("mp_item_", i, " did not return 6 response-option columns. Check item matching."))
+  }
+  
+  dat_main[[paste0("mp_item_", i)]] <- decode_onehot_score(
+    data = dat_main,
+    cols = item_cols,
+    score_map = c(1, 2, 3, 4, 5, 6)
+  )
+}
+
+genes_items <- paste0("mp_item_", c(2, 6, 9, 13, 15, 18, 21, 24))
+parents_items <- paste0("mp_item_", c(1, 4, 8, 10, 12, 16, 19, 22))
+provider_items <- paste0("mp_item_", c(3, 5, 7, 11, 14, 17, 20, 23))
+
+dat_main <- dat_main %>%
+  mutate(
+    mp_good_genes = rowMeans(across(all_of(genes_items)), na.rm = TRUE),
+    mp_good_parents = rowMeans(across(all_of(parents_items)), na.rm = TRUE),
+    mp_good_providers = rowMeans(across(all_of(provider_items)), na.rm = TRUE),
+    genes_vs_parents = mp_good_genes - mp_good_parents,
+    genes_vs_providers = mp_good_genes - mp_good_providers,
+    genes_vs_security = mp_good_genes - (mp_good_parents + mp_good_providers) / 2
+  )
+
+dat_main %>%
+  group_by(region_final) %>%
+  summarise(
+    n = n(),
+    genes_mean = mean(mp_good_genes, na.rm = TRUE),
+    genes_sd = sd(mp_good_genes, na.rm = TRUE),
+    parents_mean = mean(mp_good_parents, na.rm = TRUE),
+    parents_sd = sd(mp_good_parents, na.rm = TRUE),
+    providers_mean = mean(mp_good_providers, na.rm = TRUE),
+    providers_sd = sd(mp_good_providers, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+dat_main %>%
+  group_by(region_final) %>%
+  summarise(
+    n = n(),
+    gvp_mean = mean(genes_vs_parents, na.rm = TRUE),
+    gvp_sd = sd(genes_vs_parents, na.rm = TRUE),
+    gvr_mean = mean(genes_vs_providers, na.rm = TRUE),
+    gvr_sd = sd(genes_vs_providers, na.rm = TRUE),
+    gvs_mean = mean(genes_vs_security, na.rm = TRUE),
+    gvs_sd = sd(genes_vs_security, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+wa_item_text <- c(
+  "我在生活决策上是自由的",
+  "我的家庭尊重我的观点",
+  "在自己兴趣爱好方面我完全独立",
+  "我在个人成长方面受到鼓励",
+  "我在职业选择上完全独立",
+  "我没有受到家庭成员的施压",
+  "我被视为家庭中重要的一员",
+  "我可以完全独立地按自己意愿装饰房子",
+  "我可以自由决定在需要时外出",
+  "女性必须顺从男性",
+  "女性必须遵从男性的决定",
+  "女性的成功取决于她们遵从男性的程度",
+  "女性低于男性",
+  "男性比女性更适合担任领导",
+  "男性比女性更擅长处理财务",
+  "男性具有比女性更强的智力能力",
+  "我害怕在家族中失去名誉",
+  "我害怕被贴上“无耻”或“不守礼”的标签"
+)
+
+for (i in 1:18) {
+  item_cols <- names(dat_main)[
+    str_detect(names(dat_main), fixed(wa_item_text[i]))
+  ]
+  
+  item_cols <- c(
+    item_cols[str_detect(item_cols, " - 非常不同意$")],
+    item_cols[str_detect(item_cols, " - 不同意$")],
+    item_cols[str_detect(item_cols, " - 略微不同意$")],
+    item_cols[str_detect(item_cols, " - 不确定/说不清$")],
+    item_cols[str_detect(item_cols, " - 略微同意$")],
+    item_cols[str_detect(item_cols, " - 同意$")],
+    item_cols[str_detect(item_cols, " - 非常同意$")]
+  )
+  
+  if (length(item_cols) != 7) {
+    stop(paste0("wa_item_", i, " did not return 7 response-option columns. Check item matching."))
+  }
+  
+  dat_main[[paste0("wa_item_", i)]] <- decode_onehot_score(
+    data = dat_main,
+    cols = item_cols,
+    score_map = 1:7
+  )
+}
+
+for (i in 1:18) {
+  if (i %in% 10:18) {
+    dat_main[[paste0("wa_item_", i, "_r")]] <- 8 - dat_main[[paste0("wa_item_", i)]]
+  } else {
+    dat_main[[paste0("wa_item_", i, "_r")]] <- dat_main[[paste0("wa_item_", i)]]
+  }
+}
+
+wa_all_items_r <- paste0("wa_item_", 1:18, "_r")
+
+dat_main <- dat_main %>%
+  mutate(
+    wa_total = rowMeans(across(all_of(wa_all_items_r)), na.rm = TRUE)
+  )
+
+psych::alpha(dat_main[, wa_all_items_r])
+
+dat_main %>%
+  group_by(region_final) %>%
+  summarise(
+    n = sum(!is.na(wa_total)),
+    wa_mean = mean(wa_total, na.rm = TRUE),
+    wa_sd = sd(wa_total, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+t_wa <- t.test(wa_total ~ region_final, data = dat_main)
+d_wa <- effsize::cohen.d(wa_total ~ region_final, data = dat_main)
+
+t_wa
+d_wa
+
+wsa_prefix <- "请根据您对每一陈述的真实感受进行回答。（每一陈述仅限选择一个分数）"
+
+wsa_cols_all <- names(dat_main)[
+  str_detect(names(dat_main), fixed(wsa_prefix))
+]
+
+for (i in 1:17) {
+  item_cols <- wsa_cols_all[
+    str_detect(wsa_cols_all, regex(paste0("\\s*", i, "\\.")))
+  ]
+  
+  item_cols <- c(
+    item_cols[str_detect(item_cols, " - 非常同意$")],
+    item_cols[str_detect(item_cols, " - 2$")],
+    item_cols[str_detect(item_cols, " - 3$")],
+    item_cols[str_detect(item_cols, " - 4$")],
+    item_cols[str_detect(item_cols, " - 非常不同意$")]
+  )
+  
+  if (length(item_cols) != 5) {
+    stop(paste0("wsa_item_", i, " did not return 5 response-option columns. Check item matching."))
+  }
+  
+  dat_main[[paste0("wsa_item_", i)]] <- decode_onehot_score(
+    data = dat_main,
+    cols = item_cols,
+    score_map = c(5, 4, 3, 2, 1)
+  )
+}
+
+wsa_reverse_items <- c(1, 2, 6, 10, 11, 12, 13)
+
+for (i in 1:17) {
+  if (i %in% wsa_reverse_items) {
+    dat_main[[paste0("wsa_item_", i, "_r")]] <- 6 - dat_main[[paste0("wsa_item_", i)]]
+  } else {
+    dat_main[[paste0("wsa_item_", i, "_r")]] <- dat_main[[paste0("wsa_item_", i)]]
+  }
+}
+
+wsa_all_items_r <- paste0("wsa_item_", 1:17, "_r")
+
+dat_main <- dat_main %>%
+  mutate(
+    wsa_total = rowMeans(across(all_of(wsa_all_items_r)), na.rm = TRUE)
+  )
+
+psych::alpha(dat_main[, wsa_all_items_r])
+
+dat_main %>%
+  group_by(region_final) %>%
+  summarise(
+    n = sum(!is.na(wsa_total)),
+    wsa_mean = mean(wsa_total, na.rm = TRUE),
+    wsa_sd = sd(wsa_total, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+t_wsa <- t.test(wsa_total ~ region_final, data = dat_main)
+d_wsa <- effsize::cohen.d(wsa_total ~ region_final, data = dat_main)
+
+t_wsa
+d_wsa
+
+t_gvp <- t.test(genes_vs_parents ~ region_final, data = dat_main)
+t_gvr <- t.test(genes_vs_providers ~ region_final, data = dat_main)
+t_gvs <- t.test(genes_vs_security ~ region_final, data = dat_main)
+
+d_gvp <- effsize::cohen.d(genes_vs_parents ~ region_final, data = dat_main)
+d_gvr <- effsize::cohen.d(genes_vs_providers ~ region_final, data = dat_main)
+d_gvs <- effsize::cohen.d(genes_vs_security ~ region_final, data = dat_main)
+
+t_gvp
+t_gvr
+t_gvs
+
+d_gvp
+d_gvr
+d_gvs
+
+table1_values <- data.frame(
+  Outcome = c(
+    "General agency autonomy",
+    "Intimate/sexual autonomy",
+    "Good genes vs. good parents",
+    "Good genes vs. good providers",
+    "Good genes vs. security"
+  ),
+  Inner_Mongolia_M_SD = c(
+    "5.09 (0.86)",
+    "3.34 (0.60)",
+    "-0.80 (0.78)",
+    "-0.66 (0.88)",
+    "-0.73 (0.71)"
+  ),
+  Yunnan_M_SD = c(
+    "5.57 (1.14)",
+    "3.83 (0.55)",
+    "0.06 (0.98)",
+    "0.12 (0.98)",
+    "0.09 (0.92)"
+  ),
+  Welch_t = c(-3.33, -5.53, -6.74, -5.71, -6.98),
+  p = c(".001", "< .001", "< .001", "< .001", "< .001"),
+  d = c(0.45, 0.87, 0.93, 0.82, 0.96)
+)
+
+table1_values
+
+dat_main <- dat_main %>%
+  mutate(
+    wa_z = as.numeric(scale(wa_total)),
+    wsa_z = as.numeric(scale(wsa_total)),
+    exec_auto = rowMeans(across(c(wa_z, wsa_z)), na.rm = TRUE)
+  )
+
+summary(dat_main$exec_auto)
+cor(dat_main$wa_total, dat_main$wsa_total, use = "pairwise.complete.obs")
+
+m_exec_gvp <- lm(genes_vs_parents ~ exec_auto, data = dat_main)
+m_exec_gvr <- lm(genes_vs_providers ~ exec_auto, data = dat_main)
+m_exec_gvs <- lm(genes_vs_security ~ exec_auto, data = dat_main)
+
+summary(m_exec_gvp)
+summary(m_exec_gvr)
+summary(m_exec_gvs)
+
+dat_h5 <- dat_main %>%
+  select(
+    region_final,
+    exec_auto,
+    genes_vs_parents,
+    genes_vs_providers,
+    genes_vs_security
+  ) %>%
+  na.omit() %>%
+  droplevels()
+
+dat_h5$region_final <- factor(
+  dat_h5$region_final,
+  levels = c("Inner Mongolia", "Yunnan")
+)
+
+m_a_exec <- lm(exec_auto ~ region_final, data = dat_h5)
+
+m_c_gvp <- lm(genes_vs_parents ~ region_final, data = dat_h5)
+m_c_gvr <- lm(genes_vs_providers ~ region_final, data = dat_h5)
+m_c_gvs <- lm(genes_vs_security ~ region_final, data = dat_h5)
+
+m_exec_gvp_r <- lm(genes_vs_parents ~ region_final + exec_auto, data = dat_h5)
+m_exec_gvr_r <- lm(genes_vs_providers ~ region_final + exec_auto, data = dat_h5)
+m_exec_gvs_r <- lm(genes_vs_security ~ region_final + exec_auto, data = dat_h5)
+
+summary(m_a_exec)
+
+summary(m_c_gvp)
+summary(m_c_gvr)
+summary(m_c_gvs)
+
+summary(m_exec_gvp_r)
+summary(m_exec_gvr_r)
+summary(m_exec_gvs_r)
+
+attenuation_pct <- function(total_model, adjusted_model, coef_name = "region_finalYunnan") {
+  total_beta <- coef(total_model)[coef_name]
+  adj_beta <- coef(adjusted_model)[coef_name]
+  (total_beta - adj_beta) / total_beta * 100
+}
+
+attenuation_results <- c(
+  GVP_reduction_pct = attenuation_pct(m_c_gvp, m_exec_gvp_r),
+  GVR_reduction_pct = attenuation_pct(m_c_gvr, m_exec_gvr_r),
+  GVS_reduction_pct = attenuation_pct(m_c_gvs, m_exec_gvs_r)
+)
+
+attenuation_results
+
+dat_h5_med <- dat_h5 %>%
+  mutate(
+    region_bin = ifelse(region_final == "Yunnan", 1, 0)
+  )
+
+med_model <- lm(exec_auto ~ region_bin, data = dat_h5_med)
+
+out_gvp <- lm(genes_vs_parents ~ region_bin + exec_auto, data = dat_h5_med)
+out_gvr <- lm(genes_vs_providers ~ region_bin + exec_auto, data = dat_h5_med)
+out_gvs <- lm(genes_vs_security ~ region_bin + exec_auto, data = dat_h5_med)
+
+set.seed(1234)
+
+med_gvp <- mediate(
+  model.m = med_model,
+  model.y = out_gvp,
+  treat = "region_bin",
+  mediator = "exec_auto",
+  boot = TRUE,
+  sims = 5000
+)
+
+med_gvr <- mediate(
+  model.m = med_model,
+  model.y = out_gvr,
+  treat = "region_bin",
+  mediator = "exec_auto",
+  boot = TRUE,
+  sims = 5000
+)
+
+med_gvs <- mediate(
+  model.m = med_model,
+  model.y = out_gvs,
+  treat = "region_bin",
+  mediator = "exec_auto",
+  boot = TRUE,
+  sims = 5000
+)
+
+summary(med_gvp)
+summary(med_gvr)
+summary(med_gvs)
+
+extract_med <- function(x, dv_name) {
+  data.frame(
+    DV = dv_name,
+    ACME_est = x$d0,
+    ACME_CI_low = x$d0.ci[1],
+    ACME_CI_high = x$d0.ci[2],
+    ACME_p = x$d0.p,
+    ADE_est = x$z0,
+    ADE_CI_low = x$z0.ci[1],
+    ADE_CI_high = x$z0.ci[2],
+    ADE_p = x$z0.p,
+    Total_est = x$tau.coef,
+    Total_CI_low = x$tau.ci[1],
+    Total_CI_high = x$tau.ci[2],
+    Total_p = x$tau.p,
+    PropMed_est = x$n0,
+    PropMed_CI_low = x$n0.ci[1],
+    PropMed_CI_high = x$n0.ci[2],
+    PropMed_p = x$n0.p
+  )
+}
+
+med_results <- bind_rows(
+  extract_med(med_gvp, "genes_vs_parents"),
+  extract_med(med_gvr, "genes_vs_providers"),
+  extract_med(med_gvs, "genes_vs_security")
+)
+
+med_results
+
+dat_robust <- dat_main %>%
+  select(
+    region_final,
+    exec_auto,
+    age_clean,
+    education_3,
+    wa_total,
+    wsa_total,
+    genes_vs_parents,
+    genes_vs_providers,
+    genes_vs_security
+  ) %>%
+  na.omit() %>%
+  droplevels()
+
+nrow(dat_robust)
+table(dat_robust$region_final)
+table(dat_robust$education_3)
+colSums(is.na(dat_robust))
+
+rob_wa <- lm(
+  wa_total ~ region_final + age_clean + education_3,
+  data = dat_robust
+)
+
+rob_wsa <- lm(
+  wsa_total ~ region_final + age_clean + education_3,
+  data = dat_robust
+)
+
+rob_gvp <- lm(
+  genes_vs_parents ~ region_final + exec_auto + age_clean + education_3,
+  data = dat_robust
+)
+
+rob_gvr <- lm(
+  genes_vs_providers ~ region_final + exec_auto + age_clean + education_3,
+  data = dat_robust
+)
+
+rob_gvs <- lm(
+  genes_vs_security ~ region_final + exec_auto + age_clean + education_3,
+  data = dat_robust
+)
+
+summary(rob_wa)
+summary(rob_wsa)
+summary(rob_gvp)
+summary(rob_gvr)
+summary(rob_gvs)
+
+write.csv(table1_values, "table1_regional_differences.csv", row.names = FALSE)
+write.csv(med_results, "bootstrap_indirect_association_results.csv", row.names = FALSE)
